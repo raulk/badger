@@ -1,5 +1,6 @@
 language: go
 go: 1.8
+script: go test -race ./...
 notifications:
   email: false
   slack:

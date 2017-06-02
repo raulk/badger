@@ -176,7 +176,7 @@ func (it *Iterator) prefetch() {
 	var count int
 	it.item = nil
 	for ; i.Valid(); i.Next() {
-		if bytes.HasPrefix(it.iitr.Key(), badgerPrefix) {
+		if bytes.HasPrefix(i.Key(), badgerPrefix) {
 			continue
 		}
 		if i.Value().Meta&BitDelete > 0 {
