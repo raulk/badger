@@ -29,8 +29,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/gxed/bbloom"
 	"github.com/dgraph-io/badger/y"
+	"github.com/gxed/bbloom"
 	"github.com/pkg/errors"
 )
 
