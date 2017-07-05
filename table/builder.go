@@ -223,7 +223,7 @@ func (b *TableBuilder) blockIndex() []byte {
 
 // Finish finishes the table by appending the index.
 func (b *TableBuilder) Finish(metadata []byte) []byte {
-	bf := bbloom.New(float64(b.keyCount), 0.01)
+	bf, _ := bbloom.New(float64(b.keyCount), 0.01)
 	var klen [2]byte
 	key := make([]byte, 1024)
 	for {
@@ -246,7 +246,7 @@ func (b *TableBuilder) Finish(metadata []byte) []byte {
 	b.buf.Write(index)
 
 	// Write bloom filter.
-	bdata := bf.JSONMarshal()
+	bdata, _ := bf.JSONMarshal()
 	n, err := b.buf.Write(bdata)
 	y.Check(err)
 	var buf [4]byte

@@ -228,7 +228,7 @@ func (t *Table) readIndex() error {
 	bloomLen := int(binary.BigEndian.Uint32(buf))
 	readPos -= bloomLen
 	data := t.readNoFail(readPos, bloomLen)
-	t.bf = bbloom.JSONUnmarshal(data)
+	t.bf = *bbloom.JSONUnmarshal(data)
 
 	readPos -= 4
 	buf = t.readNoFail(readPos, 4)
