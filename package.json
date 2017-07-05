@@ -4,13 +4,33 @@
     "url": "https://github.com/dgraph-io/badger"
   },
   "gx": {
-    "dvcsimport": "github.com/gxed/badger"
+    "dvcsimport": "github.com/dgraph-io/badger"
   },
+  "gxDependencies": [
+    {
+      "author": "whyrusleeping",
+      "hash": "QmVmDhyTTUcQXFD1rRQ64fGLMSAoaQvNH3hwuaCFAPq2hy",
+      "name": "errors",
+      "version": "0.0.1"
+    },
+    {
+      "author": "magik6k",
+      "hash": "Qmbvv2urkn5Wtwws4yzjE85qRjB293EodchZofJsrTRuvN",
+      "name": "go-lz4",
+      "version": "1.0.0"
+    },
+    {
+      "author": "golang",
+      "hash": "QmQZnd8Ajfw9zUUG9MjK9TKnuXRqNdRAFrb69BsRjh61b4",
+      "name": "net",
+      "version": "1.0.0"
+    }
+  ],
   "gxVersion": "0.10.0",
   "language": "go",
   "license": "Apache 2.0",
   "name": "badger",
   "releaseCmd": "git commit -a -m \"gx publish $VERSION\"",
-  "version": "1.0.0"
+  "version": "1.0.1"
 }
 
