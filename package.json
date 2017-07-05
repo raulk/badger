@@ -24,6 +24,18 @@
       "hash": "QmQZnd8Ajfw9zUUG9MjK9TKnuXRqNdRAFrb69BsRjh61b4",
       "name": "net",
       "version": "1.0.0"
+    },
+    {
+      "author": "kubuxu",
+      "hash": "QmeiMCBkYHxkDkDfnDadzz4YxY5ruL5Pj499essE4vRsGM",
+      "name": "bbloom",
+      "version": "0.1.0"
+    },
+    {
+      "author": "golang",
+      "hash": "Qmacz8FDDoZHpgtTBQ4prUvnm7YPMWY77GjPmBSgrJt6Yd",
+      "name": "sys",
+      "version": "1.0.0"
     }
   ],
   "gxVersion": "0.10.0",
@@ -31,6 +43,6 @@
   "license": "Apache 2.0",
   "name": "badger",
   "releaseCmd": "git commit -a -m \"gx publish $VERSION\"",
-  "version": "1.0.1"
+  "version": "1.0.2"
 }
 
