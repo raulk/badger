@@ -21,9 +21,9 @@
     },
     {
       "author": "kubuxu",
-      "hash": "QmeiMCBkYHxkDkDfnDadzz4YxY5ruL5Pj499essE4vRsGM",
+      "hash": "QmXqKGu7QzfRzFC4yd5aL9sThYx22vY163VGwmxfp5qGHk",
       "name": "bbloom",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ],
   "gxVersion": "0.10.0",
@@ -31,6 +31,6 @@
   "license": "Apache 2.0",
   "name": "badger",
   "releaseCmd": "git commit -a -m \"gx publish $VERSION\"",
-  "version": "1.1.2"
+  "version": "1.1.3"
 }
 
