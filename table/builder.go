@@ -201,7 +201,7 @@ func (b *Builder) blockIndex() []byte {
 }
 
 // Finish finishes the table by appending the index.
-func (b *Builder) Finish(metadata []byte) []byte {
+func (b *Builder) Finish() []byte {
 	bf, _ := bbloom.New(float64(b.keyCount), 0.01)
 	var klen [2]byte
 	key := make([]byte, 1024)
