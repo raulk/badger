@@ -26,39 +26,14 @@ import (
 	"github.com/gxed/bbloom"
 )
 
-//var tableSize int64 = 50 << 20
 var (
-	restartInterval int = 100 // Might want to change this to be based on total size instead of numKeys.
-	bufPool             = new(bufferPool)
+	restartInterval = 100 // Might want to change this to be based on total size instead of numKeys.
 )
 
-func init() {
-	bufPool.Ch = make(chan *bytes.Buffer, 10)
-}
-
-type bufferPool struct {
-	Ch chan *bytes.Buffer
-}
-
-func (p *bufferPool) Put(b *bytes.Buffer) {
-	b.Reset()
-
-	select {
-	case p.Ch <- b:
-	default:
-		// ignore
-	}
-}
-
-func (p *bufferPool) Get() *bytes.Buffer {
-	select {
-	case b := <-p.Ch:
-		return b
-	default:
-		b := new(bytes.Buffer)
-		b.Grow(64 << 20)
-		return b
-	}
+func newBuffer(sz int) *bytes.Buffer {
+	b := new(bytes.Buffer)
+	b.Grow(sz)
+	return b
 }
 
 type header struct {
@@ -88,7 +63,8 @@ func (h *header) Decode(buf []byte) int {
 // Size returns size of the header. Currently it's just a constant.
 func (h header) Size() int { return 10 }
 
-type TableBuilder struct {
+// Builder is used in building a table.
+type Builder struct {
 	counter int // Number of keys written for the current block.
 
 	// Typically tens or hundreds of meg. This is for one single file.
@@ -106,24 +82,23 @@ type TableBuilder struct {
 	keyCount int
 }
 
-func NewTableBuilder() *TableBuilder {
-	return &TableBuilder{
-		keyBuf:     bufPool.Get(),
-		buf:        bufPool.Get(),
+// NewTableBuilder makes a new TableBuilder.
+func NewTableBuilder() *Builder {
+	return &Builder{
+		keyBuf:     newBuffer(32 << 20),
+		buf:        newBuffer(64 << 20),
 		prevOffset: math.MaxUint32, // Used for the first element!
 	}
 }
 
-// Close closes the TableBuilder. Do not use buf field anymore.
-func (b *TableBuilder) Close() {
-	bufPool.Put(b.buf)
-	bufPool.Put(b.keyBuf)
-}
+// Close closes the TableBuilder.
+func (b *Builder) Close() {}
 
-func (b *TableBuilder) Empty() bool { return b.buf.Len() == 0 }
+// Empty returns whether it's empty.
+func (b *Builder) Empty() bool { return b.buf.Len() == 0 }
 
 // keyDiff returns a suffix of newKey that is different from b.baseKey.
-func (b TableBuilder) keyDiff(newKey []byte) []byte {
+func (b Builder) keyDiff(newKey []byte) []byte {
 	var i int
 	for i = 0; i < len(newKey) && i < len(b.baseKey); i++ {
 		if newKey[i] != b.baseKey[i] {
@@ -133,7 +108,7 @@ func (b TableBuilder) keyDiff(newKey []byte) []byte {
 	return newKey[i:]
 }
 
-func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
+func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	// Add key to bloom filter.
 	var klen [2]byte
 	binary.BigEndian.PutUint16(klen[:], uint16(len(key)))
@@ -155,8 +130,8 @@ func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
 	h := header{
 		plen: uint16(len(key) - len(diffKey)),
 		klen: uint16(len(diffKey)),
-		vlen: uint16(len(v.Value) + 1 + 2), // Include meta byte and casCounter.
-		prev: b.prevOffset,                 // prevOffset is the location of the last key-value added.
+		vlen: uint16(len(v.Value) + y.MetaSize + y.UserMetaSize + y.CasSize),
+		prev: b.prevOffset, // prevOffset is the location of the last key-value added.
 	}
 	b.prevOffset = uint32(b.buf.Len()) - b.baseOffset // Remember current offset for the next Add call.
 
@@ -166,14 +141,15 @@ func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
 	b.buf.Write(hbuf[:])
 	b.buf.Write(diffKey)    // We only need to store the key difference.
 	b.buf.WriteByte(v.Meta) // Meta byte precedes actual value.
-	var casBytes [2]byte
-	binary.BigEndian.PutUint16(casBytes[:], v.CASCounter)
+	b.buf.WriteByte(v.UserMeta)
+	var casBytes [y.CasSize]byte
+	binary.BigEndian.PutUint64(casBytes[:], v.CASCounter)
 	b.buf.Write(casBytes[:])
 	b.buf.Write(v.Value)
 	b.counter++ // Increment number of keys added for this current block.
 }
 
-func (b *TableBuilder) finishBlock() {
+func (b *Builder) finishBlock() {
 	// When we are at the end of the block and Valid=false, and the user wants to do a Prev,
 	// we need a dummy header to tell us the offset of the previous key-value pair.
 	b.addHelper([]byte{}, y.ValueStruct{})
@@ -181,7 +157,7 @@ func (b *TableBuilder) finishBlock() {
 
 // Add adds a key-value pair to the block.
 // If doNotRestart is true, we will not restart even if b.counter >= restartInterval.
-func (b *TableBuilder) Add(key []byte, value y.ValueStruct) error {
+func (b *Builder) Add(key []byte, value y.ValueStruct) error {
 	if b.counter >= restartInterval {
 		b.finishBlock()
 		// Start a new block. Initialize the block.
@@ -195,17 +171,20 @@ func (b *TableBuilder) Add(key []byte, value y.ValueStruct) error {
 	return nil // Currently, there is no meaningful error.
 }
 
+// TODO: vvv this was the comment on ReachedCapacity.
 // FinalSize returns the *rough* final size of the array, counting the header which is not yet written.
 // TODO: Look into why there is a discrepancy. I suspect it is because of Write(empty, empty)
 // at the end. The diff can vary.
-func (b *TableBuilder) ReachedCapacity(cap int64) bool {
+
+// ReachedCapacity returns true if we... roughly (?) reached capacity?
+func (b *Builder) ReachedCapacity(cap int64) bool {
 	estimateSz := b.buf.Len() + 8 /* empty header */ + 4*len(b.restarts) + 8 // 8 = end of buf offset + len(restarts).
 	return int64(estimateSz) > cap
 }
 
 // blockIndex generates the block index for the table.
 // It is mainly a list of all the block base offsets.
-func (b *TableBuilder) blockIndex() []byte {
+func (b *Builder) blockIndex() []byte {
 	// Store the end offset, so we know the length of the final block.
 	b.restarts = append(b.restarts, uint32(b.buf.Len()))
 
@@ -222,7 +201,7 @@ func (b *TableBuilder) blockIndex() []byte {
 }
 
 // Finish finishes the table by appending the index.
-func (b *TableBuilder) Finish(metadata []byte) []byte {
+func (b *Builder) Finish(metadata []byte) []byte {
 	bf, _ := bbloom.New(float64(b.keyCount), 0.01)
 	var klen [2]byte
 	key := make([]byte, 1024)
@@ -251,10 +230,6 @@ func (b *TableBuilder) Finish(metadata []byte) []byte {
 	y.Check(err)
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(n))
-	b.buf.Write(buf[:])
-
-	b.buf.Write(metadata)
-	binary.BigEndian.PutUint32(buf[:], uint32(len(metadata)))
 	b.buf.Write(buf[:])
 
 	return b.buf.Bytes()

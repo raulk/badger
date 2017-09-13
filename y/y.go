@@ -17,38 +17,81 @@
 package y
 
 import (
-	"log"
+	"hash/crc32"
 	"os"
 	"sync"
-	"sync/atomic"
+
+	"github.com/pkg/errors"
 )
+
+// Constants used in serialization sizes, and in ValueStruct serialization
+const (
+	MetaSize     = 1
+	UserMetaSize = 1
+	CasSize      = 8
+)
+
+// ErrEOF indicates an end of file when trying to read from a memory mapped file
+// and encountering the end of slice.
+var ErrEOF = errors.New("End of mapped region")
 
 var (
-	EmptySlice   = []byte{}
-	syncFileFlag = 0x0
+	// This is O_DSYNC (datasync) on platforms that support it -- see file_unix.go
+	datasyncFileFlag = 0x0
+
+	// CastagnoliCrcTable is a CRC32 polynomial table
+	CastagnoliCrcTable = crc32.MakeTable(crc32.Castagnoli)
 )
 
-func OpenSyncedFile(filename string, sync bool) (*os.File, error) {
-	flags := os.O_RDWR | os.O_CREATE
+// OpenExistingSyncedFile opens an existing file, errors if it doesn't exist.
+func OpenExistingSyncedFile(filename string, sync bool) (*os.File, error) {
+	flags := os.O_RDWR
 	if sync {
-		flags |= syncFileFlag
+		flags |= datasyncFileFlag
+	}
+	return os.OpenFile(filename, flags, 0)
+}
+
+// CreateSyncedFile creates a new file (using O_EXCL), errors if it already existed.
+func CreateSyncedFile(filename string, sync bool) (*os.File, error) {
+	flags := os.O_RDWR | os.O_CREATE | os.O_EXCL
+	if sync {
+		flags |= datasyncFileFlag
 	}
 	return os.OpenFile(filename, flags, 0666)
 }
 
-func Safecopy(a []byte, src []byte) []byte {
-	if cap(a) < len(src) {
-		a = make([]byte, len(src))
+// OpenSyncedFile creates the file if one doesn't exist.
+func OpenSyncedFile(filename string, sync bool) (*os.File, error) {
+	flags := os.O_RDWR | os.O_CREATE
+	if sync {
+		flags |= datasyncFileFlag
 	}
-	a = a[:len(src)]
-	copy(a, src)
-	return a
+	return os.OpenFile(filename, flags, 0666)
 }
 
+// OpenTruncFile opens the file with O_RDWR | O_CREATE | O_TRUNC
+func OpenTruncFile(filename string, sync bool) (*os.File, error) {
+	flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
+	if sync {
+		flags |= datasyncFileFlag
+	}
+	return os.OpenFile(filename, flags, 0666)
+}
+
+// Safecopy does append(a[:0], src...).
+func Safecopy(a []byte, src []byte) []byte {
+	return append(a[:0], src...)
+}
+
+// Slice holds a reusable buf, will reallocate if you request a larger size than ever before.
+// One problem is with n distinct sizes in random order it'll reallocate log(n) times.
 type Slice struct {
 	buf []byte
 }
 
+// Resize reuses the Slice's buffer (or makes a new one) and returns a slice in that buffer of
+// length sz.
 func (s *Slice) Resize(sz int) []byte {
 	if cap(s.buf) < sz {
 		s.buf = make([]byte, sz)
@@ -56,115 +99,49 @@ func (s *Slice) Resize(sz int) []byte {
 	return s.buf[0:sz]
 }
 
-type LevelCloser struct {
-	Name    string
-	running int32
-	nomore  int32
+// Closer holds the two things we need to close a goroutine and wait for it to finish: a chan
+// to tell the goroutine to shut down, and a WaitGroup with which to wait for it to finish shutting
+// down.
+type Closer struct {
 	closed  chan struct{}
 	waiting sync.WaitGroup
 }
 
-type Closer struct {
-	sync.RWMutex
-	levels map[string]*LevelCloser
+// NewCloser constructs a new Closer, with an initial count on the WaitGroup.
+func NewCloser(initial int) *Closer {
+	ret := &Closer{closed: make(chan struct{})}
+	ret.waiting.Add(initial)
+	return ret
 }
 
-func NewCloser() *Closer {
-	return &Closer{
-		levels: make(map[string]*LevelCloser),
-	}
+// AddRunning Add()'s delta to the WaitGroup.
+func (lc *Closer) AddRunning(delta int) {
+	lc.waiting.Add(delta)
 }
 
-func (c *Closer) Register(name string) *LevelCloser {
-	c.Lock()
-	defer c.Unlock()
-
-	lc, has := c.levels[name]
-	if !has {
-		lc = &LevelCloser{Name: name, closed: make(chan struct{}, 10)}
-		lc.waiting.Add(1)
-		c.levels[name] = lc
-	}
-
-	AssertTruef(atomic.LoadInt32(&lc.nomore) == 0, "Can't register with closer after signal.")
-	atomic.AddInt32(&lc.running, 1)
-	return lc
+// Signal signals the HasBeenClosed signal.
+func (lc *Closer) Signal() {
+	close(lc.closed)
 }
 
-func (c *Closer) Get(name string) *LevelCloser {
-	c.RLock()
-	defer c.RUnlock()
-
-	lc, has := c.levels[name]
-	if !has {
-		log.Fatalf("%q not present in Closer", name)
-		return nil
-	}
-	return lc
-}
-
-func (c *Closer) SignalAll() {
-	c.RLock()
-	defer c.RUnlock()
-
-	for _, l := range c.levels {
-		l.Signal()
-	}
-}
-
-func (c *Closer) WaitForAll() {
-	c.RLock()
-	defer c.RUnlock()
-
-	for _, l := range c.levels {
-		l.Wait()
-	}
-}
-
-func (lc *LevelCloser) AddRunning(delta int32) {
-	atomic.AddInt32(&lc.running, delta)
-}
-
-func (lc *LevelCloser) NumRunning() int {
-	return int(atomic.LoadInt32(&lc.running))
-}
-
-func (lc *LevelCloser) Signal() {
-	if !atomic.CompareAndSwapInt32(&lc.nomore, 0, 1) {
-		// fmt.Printf("Level %q already got signal\n", lc.Name)
-		return
-	}
-	running := int(atomic.LoadInt32(&lc.running))
-	// fmt.Printf("Sending signal to %d registered with name %q\n", running, lc.Name)
-	for i := 0; i < running; i++ {
-		lc.closed <- struct{}{}
-	}
-}
-
-func (lc *LevelCloser) HasBeenClosed() <-chan struct{} {
+// HasBeenClosed gets signaled when Signal() is called.
+func (lc *Closer) HasBeenClosed() <-chan struct{} {
 	return lc.closed
 }
 
-func (lc *LevelCloser) GotSignal() bool {
-	return atomic.LoadInt32(&lc.nomore) == 1
+// Done calls Done() on the WaitGroup.
+func (lc *Closer) Done() {
+	lc.waiting.Done()
 }
 
-func (lc *LevelCloser) Done() {
-	if atomic.LoadInt32(&lc.running) <= 0 {
-		return
-	}
-
-	running := atomic.AddInt32(&lc.running, -1)
-	if running == 0 {
-		lc.waiting.Done()
-	}
-}
-
-func (lc *LevelCloser) Wait() {
+// Wait waits on the WaitGroup.  (It waits for NewCloser's initial value, AddRunning, and Done
+// calls to balance out.)
+func (lc *Closer) Wait() {
 	lc.waiting.Wait()
 }
 
-func (lc *LevelCloser) SignalAndWait() {
+// SignalAndWait calls Signal(), then Wait().
+func (lc *Closer) SignalAndWait() {
 	lc.Signal()
 	lc.Wait()
 }

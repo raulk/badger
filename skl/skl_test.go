@@ -30,7 +30,7 @@ import (
 	"github.com/dgraph-io/badger/y"
 )
 
-var arenaPool = NewArenaPool(1<<20, 3)
+const arenaSize = 1 << 20
 
 func newValue(v int) []byte {
 	return []byte(fmt.Sprintf("%05d", v))
@@ -49,7 +49,7 @@ func length(s *Skiplist) int {
 
 func TestEmpty(t *testing.T) {
 	key := []byte("aaa")
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 
 	v := l.Get(key)
 	require.True(t, v.Value == nil) // Cannot use require.Nil for unsafe.Pointer nil.
@@ -75,15 +75,15 @@ func TestEmpty(t *testing.T) {
 	require.False(t, it.Valid())
 
 	l.DecrRef()
-	require.True(t, l.Valid()) // Check the reference counting.
+	require.True(t, l.valid()) // Check the reference counting.
 
 	it.Close()
-	require.False(t, l.Valid()) // Check the reference counting.
+	require.False(t, l.valid()) // Check the reference counting.
 }
 
 // TestBasic tests single-threaded inserts and updates and gets.
 func TestBasic(t *testing.T) {
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	val1 := newValue(42)
 	val2 := newValue(52)
 	val3 := newValue(62)
@@ -91,9 +91,9 @@ func TestBasic(t *testing.T) {
 
 	// Try inserting values.
 	// Somehow require.Nil doesn't work when checking for unsafe.Pointer(nil).
-	l.Put([]byte("key1"), y.ValueStruct{val1, 55, 60000})
-	l.Put([]byte("key3"), y.ValueStruct{val3, 56, 60001})
-	l.Put([]byte("key2"), y.ValueStruct{val2, 57, 60002})
+	l.Put([]byte("key1"), y.MakeValueStruct(val1, 55, 0, 60000))
+	l.Put([]byte("key3"), y.MakeValueStruct(val3, 56, 0, 60001))
+	l.Put([]byte("key2"), y.MakeValueStruct(val2, 57, 0, 60002))
 
 	v := l.Get([]byte("key"))
 	require.True(t, v.Value == nil)
@@ -116,7 +116,7 @@ func TestBasic(t *testing.T) {
 	require.EqualValues(t, 56, v.Meta)
 	require.EqualValues(t, 60001, v.CASCounter)
 
-	l.Put([]byte("key2"), y.ValueStruct{val4, 12, 50000})
+	l.Put([]byte("key2"), y.MakeValueStruct(val4, 12, 0, 50000))
 	v = l.Get([]byte("key2"))
 	require.True(t, v.Value != nil)
 	require.EqualValues(t, "00072", string(v.Value))
@@ -127,14 +127,14 @@ func TestBasic(t *testing.T) {
 // TestConcurrentBasic tests concurrent writes followed by concurrent reads.
 func TestConcurrentBasic(t *testing.T) {
 	const n = 1000
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			l.Put([]byte(fmt.Sprintf("%05d", i)),
-				y.ValueStruct{newValue(i), 0, uint16(i)})
+				y.MakeValueStruct(newValue(i), 0, 0, uint64(i)))
 		}(i)
 	}
 	wg.Wait()
@@ -157,7 +157,7 @@ func TestConcurrentBasic(t *testing.T) {
 func TestOneKey(t *testing.T) {
 	const n = 100
 	key := []byte("thekey")
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 
 	var wg sync.WaitGroup
@@ -165,7 +165,7 @@ func TestOneKey(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.Put(key, y.ValueStruct{newValue(i), 0, uint16(i)})
+			l.Put(key, y.MakeValueStruct(newValue(i), 0, 0, uint64(i)))
 		}(i)
 	}
 	// We expect that at least some write made it such that some read returns a value.
@@ -191,11 +191,11 @@ func TestOneKey(t *testing.T) {
 }
 
 func TestFindNear(t *testing.T) {
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 	for i := 0; i < 1000; i++ {
 		key := fmt.Sprintf("%05d", i*10+5)
-		l.Put([]byte(key), y.ValueStruct{newValue(i), 0, uint16(i)})
+		l.Put([]byte(key), y.MakeValueStruct(newValue(i), 0, 0, uint64(i)))
 	}
 
 	n, eq := l.findNear([]byte("00001"), false, false)
@@ -298,7 +298,7 @@ func TestFindNear(t *testing.T) {
 // TestIteratorNext tests a basic iteration over all nodes from the beginning.
 func TestIteratorNext(t *testing.T) {
 	const n = 100
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 	it := l.NewIterator()
 	defer it.Close()
@@ -307,7 +307,7 @@ func TestIteratorNext(t *testing.T) {
 	require.False(t, it.Valid())
 	for i := n - 1; i >= 0; i-- {
 		l.Put([]byte(fmt.Sprintf("%05d", i)),
-			y.ValueStruct{newValue(i), 0, uint16(i)})
+			y.MakeValueStruct(newValue(i), 0, 0, uint64(i)))
 	}
 	it.SeekToFirst()
 	for i := 0; i < n; i++ {
@@ -322,7 +322,7 @@ func TestIteratorNext(t *testing.T) {
 // TestIteratorPrev tests a basic iteration over all nodes from the end.
 func TestIteratorPrev(t *testing.T) {
 	const n = 100
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 	it := l.NewIterator()
 	defer it.Close()
@@ -331,7 +331,7 @@ func TestIteratorPrev(t *testing.T) {
 	require.False(t, it.Valid())
 	for i := 0; i < n; i++ {
 		l.Put([]byte(fmt.Sprintf("%05d", i)),
-			y.ValueStruct{newValue(i), 0, uint16(i)})
+			y.MakeValueStruct(newValue(i), 0, 0, uint64(i)))
 	}
 	it.SeekToLast()
 	for i := n - 1; i >= 0; i-- {
@@ -347,7 +347,7 @@ func TestIteratorPrev(t *testing.T) {
 // TestIteratorSeek tests Seek and SeekForPrev.
 func TestIteratorSeek(t *testing.T) {
 	const n = 100
-	l := NewSkiplist(arenaPool)
+	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 
 	it := l.NewIterator()
@@ -359,7 +359,7 @@ func TestIteratorSeek(t *testing.T) {
 	// 1000, 1010, 1020, ..., 1990.
 	for i := n - 1; i >= 0; i-- {
 		v := i*10 + 1000
-		l.Put([]byte(fmt.Sprintf("%05d", i*10+1000)), y.ValueStruct{newValue(v), 0, 555})
+		l.Put([]byte(fmt.Sprintf("%05d", i*10+1000)), y.MakeValueStruct(newValue(v), 0, 0, 555))
 	}
 	it.Seek([]byte(""))
 	require.True(t, it.Valid())
@@ -425,7 +425,7 @@ func BenchmarkReadWrite(b *testing.B) {
 	for i := 0; i <= 10; i++ {
 		readFrac := float32(i) / 10.0
 		b.Run(fmt.Sprintf("frac_%d", i), func(b *testing.B) {
-			l := NewSkiplist(arenaPool) // TODO: Fix this. Allow arena size to vary with b.N.
+			l := NewSkiplist(arenaSize) // TODO: Fix this. Allow arena size to vary with b.N.
 			defer l.DecrRef()
 			b.ResetTimer()
 			var count int
@@ -437,7 +437,7 @@ func BenchmarkReadWrite(b *testing.B) {
 							count++
 						}
 					} else {
-						l.Put(randomKey(), y.ValueStruct{value, 0, 0})
+						l.Put(randomKey(), y.MakeValueStruct(value, 0, 0, 0))
 					}
 				}
 			})
