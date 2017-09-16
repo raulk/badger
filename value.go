@@ -49,18 +49,36 @@ const (
 	M               int64 = 1 << 20
 )
 
-// ErrRetry is returned when a log file containing the value is not found.
-// This usually indicates that it may have been garbage collected, and the
-// operation needs to be retried.
-var ErrRetry = errors.New("Unable to find log file. Please retry")
+var (
+	// ErrRetry is returned when a log file containing the value is not found.
+	// This usually indicates that it may have been garbage collected, and the
+	// operation needs to be retried.
+	ErrRetry = errors.New("Unable to find log file. Please retry")
 
-// ErrCasMismatch is returned when a CompareAndSet operation has failed due
-// to a counter mismatch.
-var ErrCasMismatch = errors.New("CompareAndSet failed due to counter mismatch")
+	// ErrCasMismatch is returned when a CompareAndSet operation has failed due
+	// to a counter mismatch.
+	ErrCasMismatch = errors.New("CompareAndSet failed due to counter mismatch")
 
-// ErrKeyExists is returned by SetIfAbsent metadata bit is set, but the
-// key already exists in the store.
-var ErrKeyExists = errors.New("SetIfAbsent failed since key already exists")
+	// ErrKeyExists is returned by SetIfAbsent metadata bit is set, but the
+	// key already exists in the store.
+	ErrKeyExists = errors.New("SetIfAbsent failed since key already exists")
+
+	// ErrThresholdZero is returned if threshold is set to zero, and value log GC is called.
+	// In such a case, GC can't be run.
+	ErrThresholdZero = errors.New(
+		"Value log GC can't run because threshold is set to zero.")
+
+	// ErrNoRewrite is returned if a call for value log GC doesn't result in a log file rewrite.
+	ErrNoRewrite = errors.New(
+		"Value log GC attempt didn't result in any cleanup.")
+
+	// ErrRejected is returned if a value log GC is called either while another GC is running, or
+	// after KV::Close has been called.
+	ErrRejected = errors.New("Value log GC request rejected.")
+
+	// ErrInvalidRequest is returned if the user request is invalid.
+	ErrInvalidRequest = errors.New("Invalid request")
+)
 
 const (
 	maxKeySize   = 1 << 20
@@ -366,6 +384,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	elog.Printf("Processed %d entries in total", count)
 
 	elog.Printf("Removing fid: %d", f.fid)
+	var deleteFileNow bool
 	// Entries written to LSM. Remove the older file now.
 	{
 		vlog.filesLock.Lock()
@@ -374,19 +393,62 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			vlog.filesLock.Unlock()
 			return errors.Errorf("Unable to find fid: %d", f.fid)
 		}
-		delete(vlog.filesMap, f.fid)
+		if vlog.numActiveIterators == 0 {
+			delete(vlog.filesMap, f.fid)
+			deleteFileNow = true
+		} else {
+			vlog.filesToBeDeleted = append(vlog.filesToBeDeleted, f.fid)
+		}
 		vlog.filesLock.Unlock()
 	}
 
-	// Exclusively lock the file so that there are no readers before closing/destroying it
-	f.lock.Lock()
-	rem := vlog.fpath(f.fid)
-	y.Munmap(f.fmap)
-	f.fd.Close() // close file previous to remove it
-	f.lock.Unlock()
+	if deleteFileNow {
+		vlog.deleteLogFile(f)
+	}
 
-	elog.Printf("Removing %s", rem)
-	return os.Remove(rem)
+	return nil
+}
+
+func (vlog *valueLog) incrIteratorCount() {
+	vlog.filesLock.Lock()
+	vlog.numActiveIterators++
+	vlog.filesLock.Unlock()
+}
+
+func (vlog *valueLog) decrIteratorCount() error {
+	vlog.filesLock.Lock()
+
+	vlog.numActiveIterators--
+	if vlog.numActiveIterators != 0 {
+		vlog.filesLock.Unlock()
+		return nil
+	}
+	lfs := make([]*logFile, 0, len(vlog.filesToBeDeleted))
+	for _, id := range vlog.filesToBeDeleted {
+		lfs = append(lfs, vlog.filesMap[id])
+		delete(vlog.filesMap, id)
+	}
+	vlog.filesToBeDeleted = nil
+	vlog.filesLock.Unlock()
+
+	for _, lf := range lfs {
+		if err := vlog.deleteLogFile(lf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (vlog *valueLog) deleteLogFile(lf *logFile) error {
+	path := vlog.fpath(lf.fid)
+	if err := y.Munmap(lf.fmap); err != nil {
+		_ = lf.fd.Close()
+		return err
+	}
+	if err := lf.fd.Close(); err != nil {
+		return err
+	}
+	return os.Remove(path)
 }
 
 // Entry provides Key, Value and if required, CASCounterCheck to kv.BatchSet() API.
@@ -515,14 +577,19 @@ type valueLog struct {
 	dirPath string
 	elog    trace.EventLog
 
-	// guards our view of which files exist
-	filesLock sync.RWMutex
-	filesMap  map[uint32]*logFile
+	// guards our view of which files exist, which to be deleted, how many active iterators
+	filesLock        sync.RWMutex
+	filesMap         map[uint32]*logFile
+	filesToBeDeleted []uint32
+	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
+	numActiveIterators int
 
 	kv                *KV
 	maxFid            uint32
 	writableLogOffset uint32
 	opt               Options
+
+	garbageCh chan struct{}
 }
 
 func vlogFilePath(dirPath string, fid uint32) string {
@@ -628,6 +695,7 @@ func (vlog *valueLog) Open(kv *KV, opt *Options) error {
 	}
 
 	vlog.elog = trace.NewEventLog("Badger", "Valuelog")
+	vlog.garbageCh = make(chan struct{}, 1) // Only allow one GC at a time.
 
 	return nil
 }
@@ -651,11 +719,18 @@ func (vlog *valueLog) Close() error {
 	return err
 }
 
-// sortedFids returns the file id's, sorted.  Assumes we have shared access to filesMap.
+// sortedFids returns the file id's not pending deletion, sorted.  Assumes we have shared access to
+// filesMap.
 func (vlog *valueLog) sortedFids() []uint32 {
+	toBeDeleted := make(map[uint32]struct{})
+	for _, fid := range vlog.filesToBeDeleted {
+		toBeDeleted[fid] = struct{}{}
+	}
 	ret := make([]uint32, 0, len(vlog.filesMap))
 	for fid := range vlog.filesMap {
-		ret = append(ret, fid)
+		if _, ok := toBeDeleted[fid]; !ok {
+			ret = append(ret, fid)
+		}
 	}
 	sort.Slice(ret, func(i, j int) bool {
 		return ret[i] < ret[j]
@@ -871,31 +946,13 @@ func valueBytesToEntry(buf []byte) (e Entry) {
 	return
 }
 
-func (vlog *valueLog) runGCInLoop(lc *y.Closer) {
-	defer lc.Done()
-	if vlog.opt.ValueGCThreshold == 0.0 {
-		return
-	}
-
-	tick := time.NewTicker(vlog.opt.ValueGCRunInterval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-lc.HasBeenClosed():
-			return
-		case <-tick.C:
-			vlog.doRunGC()
-		}
-	}
-}
-
 func (vlog *valueLog) pickLog() *logFile {
 	vlog.filesLock.RLock()
 	defer vlog.filesLock.RUnlock()
-	if len(vlog.filesMap) <= 1 {
+	fids := vlog.sortedFids()
+	if len(fids) <= 1 {
 		return nil
 	}
-	fids := vlog.sortedFids()
 	// This file shouldn't be being written to.
 	idx := rand.Intn(len(fids))
 	if idx > 0 {
@@ -904,10 +961,10 @@ func (vlog *valueLog) pickLog() *logFile {
 	return vlog.filesMap[fids[idx]]
 }
 
-func (vlog *valueLog) doRunGC() error {
+func (vlog *valueLog) doRunGC(gcThreshold float64) error {
 	lf := vlog.pickLog()
 	if lf == nil {
-		return nil
+		return ErrNoRewrite
 	}
 
 	type reason struct {
@@ -1006,9 +1063,9 @@ func (vlog *valueLog) doRunGC() error {
 	}
 	vlog.elog.Printf("Fid: %d Data status=%+v\n", lf.fid, r)
 
-	if r.total < 10.0 || r.discard < vlog.opt.ValueGCThreshold*r.total {
+	if r.total < 10.0 || r.discard < gcThreshold*r.total {
 		vlog.elog.Printf("Skipping GC on fid: %d\n\n", lf.fid)
-		return nil
+		return ErrNoRewrite
 	}
 
 	vlog.elog.Printf("REWRITING VLOG %d\n", lf.fid)
@@ -1017,4 +1074,25 @@ func (vlog *valueLog) doRunGC() error {
 	}
 	vlog.elog.Printf("Done rewriting.")
 	return nil
+}
+
+func (vlog *valueLog) waitOnGC(lc *y.Closer) {
+	defer lc.Done()
+
+	<-lc.HasBeenClosed() // Wait for lc to be closed.
+
+	// Block any GC in progress to finish, and don't allow any more writes to runGC by filling up
+	// the channel of size 1.
+	vlog.garbageCh <- struct{}{}
+}
+
+func (vlog *valueLog) runGC(gcThreshold float64) error {
+	select {
+	case vlog.garbageCh <- struct{}{}:
+		err := vlog.doRunGC(gcThreshold)
+		<-vlog.garbageCh
+		return err
+	default:
+		return ErrRejected
+	}
 }
