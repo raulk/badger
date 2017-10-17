@@ -42,6 +42,12 @@
       "hash": "QmXSs8cccbT4zDR95c1iRpYKDqVMzqeF1J6iZcavgE6eNw",
       "name": "protobuf",
       "version": "0.0.0"
+    },
+    {
+      "author": "magik6k",
+      "hash": "QmRFFHk2jw9tgjxv12bCuuTnSbVXxEvYQkuNCLMEv9eUwP",
+      "name": "go-farm",
+      "version": "1.0.0"
     }
   ],
   "gxVersion": "0.10.0",
@@ -49,6 +55,6 @@
   "license": "Apache 2.0",
   "name": "badger",
   "releaseCmd": "git commit -a -m \"gx publish $VERSION\"",
-  "version": "2.0.1"
+  "version": "2.0.2"
 }
 
