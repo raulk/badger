@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -32,9 +33,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func getTestOptions(dir string) *Options {
-	opt := new(Options)
-	*opt = DefaultOptions
+func getTestOptions(dir string) Options {
+	opt := DefaultOptions
 	opt.MaxTableSize = 1 << 15 // Force more compaction.
 	opt.LevelOneSize = 4 << 15 // Force more compaction.
 	opt.Dir = dir
@@ -77,6 +77,46 @@ func TestWrite(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		txnSet(t, kv, []byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), 0x00)
 	}
+}
+
+func TestUpdateAndView(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	db, err := Open(getTestOptions(dir))
+	require.NoError(t, err)
+	defer db.Close()
+
+	err = db.Update(func(txn *Txn) error {
+		for i := 0; i < 10; i++ {
+			err := txn.Set([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), 0x00)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = db.View(func(txn *Txn) error {
+		for i := 0; i < 10; i++ {
+			item, err := txn.Get([]byte(fmt.Sprintf("key%d", i)))
+			if err != nil {
+				return err
+			}
+
+			val, err := item.Value()
+			if err != nil {
+				return err
+			}
+			expected := []byte(fmt.Sprintf("val%d", i))
+			require.Equal(t, expected, val,
+				"Invalid value for key %q. expected: %q, actual: %q",
+				item.Key(), expected, val)
+		}
+		return nil
+	})
+	require.NoError(t, err)
 }
 
 func TestConcurrentWrite(t *testing.T) {
@@ -538,7 +578,7 @@ func TestIterateDeleted(t *testing.T) {
 	opt.SyncWrites = true
 	opt.Dir = dir
 	opt.ValueDir = dir
-	ps, err := Open(&opt)
+	ps, err := Open(opt)
 	require.NoError(t, err)
 	defer ps.Close()
 	txnSet(t, ps, []byte("Key1"), []byte("Value1"), 0x00)
@@ -597,8 +637,7 @@ func TestDeleteWithoutSyncWrite(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
-	opt := new(Options)
-	*opt = DefaultOptions
+	opt := DefaultOptions
 	opt.Dir = dir
 	opt.ValueDir = dir
 	kv, err := Open(opt)
@@ -807,4 +846,234 @@ func TestGetSetRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestPurgeVersionsBelow(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	db, err := Open(getTestOptions(dir))
+	require.NoError(t, err)
+
+	// Write 4 versions of the same key
+	for i := 0; i < 4; i++ {
+		err = db.Update(func(txn *Txn) error {
+			return txn.Set([]byte("answer"), []byte(fmt.Sprintf("%d", i)), 0)
+		})
+		require.NoError(t, err)
+	}
+
+	opts := DefaultIteratorOptions
+	opts.AllVersions = true
+	opts.PrefetchValues = false
+
+	// Verify that there are 4 versions, and record 3rd version (2nd from top in iteration)
+	var ts uint64
+	db.View(func(txn *Txn) error {
+		it := txn.NewIterator(opts)
+		var count int
+		for it.Rewind(); it.Valid(); it.Next() {
+			count++
+			item := it.Item()
+			if count == 2 {
+				ts = item.Version()
+			}
+			require.Equal(t, []byte("answer"), item.Key())
+		}
+		require.Equal(t, 4, count)
+		return nil
+	})
+
+	// Delete all versions below the 3rd version
+	err = db.PurgeVersionsBelow([]byte("answer"), ts)
+	require.NoError(t, err)
+
+	// Verify that there are only 2 versions left
+	db.View(func(txn *Txn) error {
+		it := txn.NewIterator(opts)
+		var count int
+		for it.Rewind(); it.Valid(); it.Next() {
+			count++
+			item := it.Item()
+			require.True(t, item.Version() >= ts,
+				"item version: %d older than ts: %d",
+				item.Version(), ts)
+			require.Equal(t, []byte("answer"), item.Key())
+		}
+		require.Equal(t, 2, count)
+		return nil
+	})
+}
+
+func TestPurgeOlderVersions(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	db, err := Open(getTestOptions(dir))
+	require.NoError(t, err)
+
+	// Write two versions of a key
+	err = db.Update(func(txn *Txn) error {
+		return txn.Set([]byte("answer"), []byte("42"), 0)
+	})
+	require.NoError(t, err)
+
+	err = db.Update(func(txn *Txn) error {
+		return txn.Set([]byte("answer"), []byte("43"), 0)
+	})
+	require.NoError(t, err)
+
+	opts := DefaultIteratorOptions
+	opts.AllVersions = true
+	opts.PrefetchValues = false
+
+	// Verify that two versions are found during iteration
+	err = db.View(func(txn *Txn) error {
+		it := txn.NewIterator(opts)
+		var count int
+		for it.Rewind(); it.Valid(); it.Next() {
+			count++
+			item := it.Item()
+			require.Equal(t, []byte("answer"), item.Key())
+		}
+		require.Equal(t, 2, count)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Invoke DeleteOlderVersions() to delete older version
+	err = db.PurgeOlderVersions()
+	require.NoError(t, err)
+
+	// Verify that only one version is found
+	err = db.View(func(txn *Txn) error {
+		it := txn.NewIterator(opts)
+		var count int
+		for it.Rewind(); it.Valid(); it.Next() {
+			count++
+			item := it.Item()
+			require.Equal(t, []byte("answer"), item.Key())
+			val, err := item.Value()
+			require.NoError(t, err)
+			t.Logf("Item value is %q", val)
+			//require.Equal(t, []byte("43"), val)
+		}
+		require.Equal(t, 1, count)
+		return nil
+	})
+}
+
+func ExampleOpen() {
+	dir, err := ioutil.TempDir("", "badger")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	opts := DefaultOptions
+	opts.Dir = dir
+	opts.ValueDir = dir
+	db, err := Open(opts)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.View(func(txn *Txn) error {
+		_, err := txn.Get([]byte("key"))
+		// We expect ErrKeyNotFound
+		fmt.Println(err)
+		return nil
+	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	txn := db.NewTransaction(true) // Read-write txn
+	err = txn.Set([]byte("key"), []byte("value"), 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = txn.Commit(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = db.View(func(txn *Txn) error {
+		item, err := txn.Get([]byte("key"))
+		if err != nil {
+			return err
+		}
+		val, err := item.Value()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\n", string(val))
+		return nil
+	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Output:
+	// Key not found
+	// value
+}
+
+func ExampleTxn_NewIterator() {
+	dir, err := ioutil.TempDir("", "badger")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	opts := DefaultOptions
+	opts.Dir = dir
+	opts.ValueDir = dir
+
+	db, err := Open(opts)
+	defer db.Close()
+
+	bkey := func(i int) []byte {
+		return []byte(fmt.Sprintf("%09d", i))
+	}
+	bval := func(i int) []byte {
+		return []byte(fmt.Sprintf("%025d", i))
+	}
+
+	txn := db.NewTransaction(true)
+
+	// Fill in 1000 items
+	n := 1000
+	for i := 0; i < n; i++ {
+		err := txn.Set(bkey(i), bval(i), 0)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	err = txn.Commit(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	opt := DefaultIteratorOptions
+	opt.PrefetchSize = 10
+
+	// Iterate over 1000 items
+	var count int
+	err = db.View(func(txn *Txn) error {
+		it := txn.NewIterator(opt)
+		for it.Rewind(); it.Valid(); it.Next() {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Counted %d elements", count)
+	// Output:
+	// Counted 1000 elements
 }

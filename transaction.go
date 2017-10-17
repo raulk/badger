@@ -243,7 +243,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 
 	item = new(Item)
 	if txn.update {
-		if e, has := txn.pendingWrites[string(key)]; has && bytes.Compare(key, e.Key) == 0 {
+		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
 			// Fulfill from cache.
 			item.meta = e.Meta
 			item.val = e.Value
@@ -311,8 +311,11 @@ func (txn *Txn) Discard() {
 //
 // 4. Batch up all writes, write them to value log and LSM tree.
 //
-// 5. If callback is provided, don't block on these writes, running this part asynchronously. The
-// callback would be run once writes are done, along with any errors.
+// 5. If callback is provided, Badger will return immediately after checking
+// for conflicts. Writes to the database will happen in the background.  If
+// there is a conflict, an error will be returned and the callback will not
+// run. If there are no conflicts, the callback will be called in the
+// background upon successful completion of writes or any error during write.
 //
 // If error is nil, the transaction is successfully committed. In case of a non-nil error, the LSM
 // tree won't be updated, so there's no need for any rollback.
@@ -377,9 +380,10 @@ func (txn *Txn) CommitAt(commitTs uint64, callback func(error)) error {
 // should only be run serially. It doesn't matter if a transaction is created by one goroutine and
 // passed down to other, as long as the Txn APIs are called serially.
 //
-// When you create a new transaction, it is absolutely essential to call Discard(). This should be
-// done irrespective of update param. Commit API internally runs Discard, but running it twice
-// wouldn't cause any issues.
+// When you create a new transaction, it is absolutely essential to call
+// Discard(). This should be done irrespective of what the update param is set
+// to. Commit API internally runs Discard, but running it twice wouldn't cause
+// any issues.
 //
 //  txn := db.NewTransaction(false)
 //  defer txn.Discard()
@@ -413,4 +417,17 @@ func (db *DB) View(fn func(txn *Txn) error) error {
 	defer txn.Discard()
 
 	return fn(txn)
+}
+
+// Update executes a function, creating and managing a read-write transaction
+// for the user. Error returned by the function is relayed by the Update method.
+func (db *DB) Update(fn func(txn *Txn) error) error {
+	txn := db.NewTransaction(true)
+	defer txn.Discard()
+
+	if err := fn(txn); err != nil {
+		return err
+	}
+
+	return txn.Commit(nil)
 }

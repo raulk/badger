@@ -192,7 +192,12 @@ func (l *list) pop() *Item {
 	return i
 }
 
-// IteratorOptions is used to set options when iterating over Badger key-value stores.
+// IteratorOptions is used to set options when iterating over Badger key-value
+// stores.
+//
+// This package provides DefaultIteratorOptions which contains options that
+// should work for most applications. Consider using that as a starting point
+// before customizing it for your own needs.
 type IteratorOptions struct {
 	// Indicates whether we should prefetch values during iteration and store them.
 	PrefetchValues bool
@@ -332,6 +337,11 @@ func (it *Iterator) parseItem() bool {
 	}
 
 	if it.opt.AllVersions {
+		// First check if value has been deleted
+		if mi.Value().Meta&bitDelete > 0 {
+			mi.Next()
+			return false
+		}
 		item := it.newItem()
 		it.fill(item)
 		setItem(item)
@@ -375,7 +385,7 @@ FILL:
 	// Reverse direction.
 	nextTs := y.ParseTs(mi.Key())
 	mik := y.ParseKey(mi.Key())
-	if nextTs <= it.readTs && bytes.Compare(mik, item.key) == 0 {
+	if nextTs <= it.readTs && bytes.Equal(mik, item.key) {
 		// This is a valid potential candidate.
 		goto FILL
 	}

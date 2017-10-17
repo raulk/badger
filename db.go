@@ -17,6 +17,7 @@
 package badger
 
 import (
+	"bytes"
 	"container/heap"
 	"expvar"
 	"log"
@@ -54,9 +55,9 @@ type closers struct {
 type DB struct {
 	sync.RWMutex // Guards list of inmemory tables, not individual reads and writes.
 
-	dirLockGuard *DirectoryLockGuard
+	dirLockGuard *directoryLockGuard
 	// nil if Dir and ValueDir are the same
-	valueDirGuard *DirectoryLockGuard
+	valueDirGuard *directoryLockGuard
 
 	closers   closers
 	elog      trace.EventLog
@@ -164,9 +165,7 @@ func replayFunction(out *DB) func(entry, valuePointer) error {
 }
 
 // Open returns a new DB object.
-func Open(optParam *Options) (db *DB, err error) {
-	// Make a copy early and fill in maxBatchSize
-	opt := *optParam
+func Open(opt Options) (db *DB, err error) {
 	opt.maxBatchSize = (15 * opt.MaxTableSize) / 100
 	opt.maxBatchCount = opt.maxBatchSize / int64(skl.MaxNodeSize)
 
@@ -188,25 +187,25 @@ func Open(optParam *Options) (db *DB, err error) {
 		return nil, err
 	}
 
-	dirLockGuard, err := AcquireDirectoryLock(opt.Dir, lockFile)
+	dirLockGuard, err := acquireDirectoryLock(opt.Dir, lockFile)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if dirLockGuard != nil {
-			_ = dirLockGuard.Release()
+			_ = dirLockGuard.release()
 		}
 	}()
-	var valueDirLockGuard *DirectoryLockGuard
+	var valueDirLockGuard *directoryLockGuard
 	if absValueDir != absDir {
-		valueDirLockGuard, err = AcquireDirectoryLock(opt.ValueDir, lockFile)
+		valueDirLockGuard, err = acquireDirectoryLock(opt.ValueDir, lockFile)
 		if err != nil {
 			return nil, err
 		}
 	}
 	defer func() {
 		if valueDirLockGuard != nil {
-			_ = valueDirLockGuard.Release()
+			_ = valueDirLockGuard.release()
 		}
 	}()
 	if !(opt.ValueLogFileSize <= 2<<30 && opt.ValueLogFileSize >= 1<<20) {
@@ -243,7 +242,7 @@ func Open(optParam *Options) (db *DB, err error) {
 
 	db.closers.updateSize = y.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
-	db.mt = skl.NewSkiplist(arenaSize(&opt))
+	db.mt = skl.NewSkiplist(arenaSize(opt))
 
 	// newLevelsController potentially loads files in directory.
 	if db.lc, err = newLevelsController(db, &manifest); err != nil {
@@ -256,7 +255,7 @@ func Open(optParam *Options) (db *DB, err error) {
 	db.closers.memtable = y.NewCloser(1)
 	go db.flushMemtable(db.closers.memtable) // Need levels controller to be up.
 
-	if err = db.vlog.Open(db, &opt); err != nil {
+	if err = db.vlog.Open(db, opt); err != nil {
 		return nil, err
 	}
 
@@ -371,11 +370,11 @@ func (db *DB) Close() (err error) {
 
 	db.elog.Finish()
 
-	if guardErr := db.dirLockGuard.Release(); err == nil {
+	if guardErr := db.dirLockGuard.release(); err == nil {
 		err = errors.Wrap(guardErr, "DB.Close")
 	}
 	if db.valueDirGuard != nil {
-		if guardErr := db.valueDirGuard.Release(); err == nil {
+		if guardErr := db.valueDirGuard.release(); err == nil {
 			err = errors.Wrap(guardErr, "DB.Close")
 		}
 	}
@@ -404,7 +403,7 @@ const (
 // in order to guarantee the file is visible (if the system crashes).  (See the man page for fsync,
 // or see https://github.com/coreos/etcd/issues/6368 for an example.)
 func syncDir(dir string) error {
-	f, err := OpenDir(dir)
+	f, err := openDir(dir)
 	if err != nil {
 		return errors.Wrapf(err, "While opening directory: %s.", dir)
 	}
@@ -710,7 +709,7 @@ func (db *DB) ensureRoomForWrite() error {
 			db.mt.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt)
-		db.mt = skl.NewSkiplist(arenaSize(&db.opt))
+		db.mt = skl.NewSkiplist(arenaSize(db.opt))
 		// New memtable is empty. We certainly have room.
 		return nil
 	default:
@@ -719,7 +718,7 @@ func (db *DB) ensureRoomForWrite() error {
 	}
 }
 
-func arenaSize(opt *Options) int64 {
+func arenaSize(opt Options) int64 {
 	return opt.MaxTableSize + opt.maxBatchSize + opt.maxBatchCount*int64(skl.MaxNodeSize)
 }
 
@@ -864,6 +863,113 @@ func (db *DB) updateSize(lc *y.Closer) {
 			return
 		}
 	}
+}
+
+// PurgeVersionsBelow will delete all versions of a key below the specified version
+func (db *DB) PurgeVersionsBelow(key []byte, ts uint64) error {
+	return db.View(func(txn *Txn) error {
+		opts := DefaultIteratorOptions
+		opts.AllVersions = true
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+
+		var entries []*entry
+
+		for it.Seek(key); it.ValidForPrefix(key); it.Next() {
+			item := it.Item()
+			if !bytes.Equal(key, item.Key()) || item.Version() >= ts {
+				continue
+			}
+
+			// Found an older version. Mark for deletion
+			entries = append(entries,
+				&entry{
+					Key:  y.KeyWithTs(key, item.version),
+					Meta: bitDelete,
+				})
+		}
+		return db.batchSet(entries)
+	})
+}
+
+// PurgeOlderVersions deletes older versions of all keys.
+//
+// This function could be called prior to doing garbage collection to clean up
+// older versions that are no longer needed. The caller must make sure that
+// there are no long-running read transactions running before this function is
+// called, otherwise they will not work as expected.
+func (db *DB) PurgeOlderVersions() error {
+	return db.View(func(txn *Txn) error {
+		opts := DefaultIteratorOptions
+		opts.AllVersions = true
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+
+		var entries []*entry
+		var lastKey []byte
+		var count int
+		var wg sync.WaitGroup
+		errChan := make(chan error, 1)
+
+		// func to check for pending error before sending off a batch for writing
+		batchSetAsyncIfNoErr := func(entries []*entry) error {
+			select {
+			case err := <-errChan:
+				return err
+			default:
+				wg.Add(1)
+				return txn.db.batchSetAsync(entries, func(err error) {
+					defer wg.Done()
+					if err != nil {
+						select {
+						case errChan <- err:
+						default:
+						}
+					}
+				})
+			}
+		}
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			if !bytes.Equal(lastKey, item.Key()) {
+				lastKey = y.Safecopy(lastKey, item.Key())
+				continue
+			}
+			// Found an older version. Mark for deletion
+			entries = append(entries,
+				&entry{
+					Key:  y.KeyWithTs(lastKey, item.version),
+					Meta: bitDelete,
+				})
+			count++
+
+			// Batch up 1000 entries at a time and write
+			if count == 1000 {
+				if err := batchSetAsyncIfNoErr(entries); err != nil {
+					return err
+				}
+				count = 0
+				entries = []*entry{}
+			}
+		}
+
+		// Write last batch pending deletes
+		if count > 0 {
+			if err := batchSetAsyncIfNoErr(entries); err != nil {
+				return err
+			}
+		}
+
+		wg.Wait()
+
+		select {
+		case err := <-errChan:
+			return err
+		default:
+			return nil
+		}
+	})
 }
 
 // RunValueLogGC would trigger a value log garbage collection with no guarantees that a call would

@@ -163,7 +163,7 @@ func TestOverlappingKeyRangeError(t *testing.T) {
 	opt := DefaultOptions
 	opt.Dir = dir
 	opt.ValueDir = dir
-	kv, err := Open(&opt)
+	kv, err := Open(opt)
 	require.NoError(t, err)
 
 	lh0 := newLevelHandler(kv, 0)
@@ -238,7 +238,7 @@ func TestManifestRewrite(t *testing.T) {
 	mf = nil
 	mf, m, err = helpOpenOrCreateManifestFile(dir, deletionsThreshold)
 	require.NoError(t, err)
-	require.Equal(t, map[uint64]TableManifest{
+	require.Equal(t, map[uint64]tableManifest{
 		uint64(deletionsThreshold * 3): {Level: 0},
 	}, m.Tables)
 }
