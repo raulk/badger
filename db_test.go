@@ -18,6 +18,8 @@ package badger
 
 import (
 	"bytes"
+	"encoding/binary"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -31,9 +33,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/options"
+
 	"github.com/dgraph-io/badger/y"
 	"github.com/stretchr/testify/require"
 )
+
+var mmap = flag.Bool("vlog_mmap", true, "Specify if value log must be memory-mapped")
 
 func getTestOptions(dir string) Options {
 	opt := DefaultOptions
@@ -42,6 +48,9 @@ func getTestOptions(dir string) Options {
 	opt.Dir = dir
 	opt.ValueDir = dir
 	opt.SyncWrites = false
+	if !*mmap {
+		opt.ValueLogLoadingMode = options.FileIO
+	}
 	return opt
 }
 
@@ -271,6 +280,64 @@ func TestTxnTooBig(t *testing.T) {
 		}
 		require.NoError(t, txn.Commit(nil))
 	})
+}
+
+func TestGetAfterPurge(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	opts := getTestOptions(dir)
+	opts.ValueLogFileSize = 15 << 20
+	db, err := OpenManaged(opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	data := func(i int) []byte {
+		return []byte(fmt.Sprintf("%b", i))
+	}
+	n := 80
+	m := 45 // Increasing would cause ErrTxnTooBig
+	sz := 32 << 10
+	v := make([]byte, sz)
+	for i := 0; i < n; i += 2 {
+		version := uint64(i)
+		txn := db.NewTransactionAt(version, true)
+		for j := 0; j < m; j++ {
+			require.NoError(t, txn.Set(data(j), v))
+		}
+		require.NoError(t, txn.CommitAt(version+1, nil))
+	}
+
+	for j := 10; j < m; j++ {
+		err := db.PurgeVersionsBelow(data(j), uint64(80))
+		require.NoError(t, err)
+	}
+	for i := 0; i < 10; i++ {
+		txn := db.NewTransactionAt(80, false)
+		item, err := txn.Get(data(i))
+		require.NoError(t, err)
+		require.Equal(t, item.Version(), uint64(79))
+		txn.Discard()
+	}
+	err = db.RunValueLogGC(0.2)
+	require.NoError(t, err)
+
+	for i := 10; i < m; i++ {
+		txn := db.NewTransactionAt(80, false)
+		_, err := txn.Get(data(i))
+		require.Equal(t, err, ErrKeyNotFound)
+		txn.Discard()
+	}
+
+	for i := 0; i < 10; i++ {
+		txn := db.NewTransactionAt(80, false)
+		item, err := txn.Get(data(i))
+		require.NoError(t, err)
+		require.Equal(t, item.Version(), uint64(79))
+		txn.Discard()
+	}
+
 }
 
 // Put a lot of data to move some data to disk.
@@ -840,17 +907,77 @@ func TestPurgeVersionsBelow(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, db.vlog.lfDiscardStats.m)
 
-		// Verify that there are only 2 versions left
+		// Verify that there are only 2 versions left, and versions
+		// below ts have been deleted.
+		db.View(func(txn *Txn) error {
+			it := txn.NewIterator(opts)
+			var count int
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				if item.Version() < ts {
+					require.True(t, item.meta&bitDelete > 0)
+				} else {
+					count++
+				}
+				require.Equal(t, []byte("answer"), item.Key())
+			}
+			require.Equal(t, 2, count)
+			return nil
+		})
+	})
+}
+
+func TestPurgeVersionsBelow2(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		// Do a set and delete of same key
+		err := db.Update(func(txn *Txn) error {
+			return txn.Set([]byte("key"), []byte("value"))
+		})
+		require.NoError(t, err)
+
+		err = db.Update(func(txn *Txn) error {
+			return txn.Delete([]byte("key"))
+		})
+		require.NoError(t, err)
+
+		opts := DefaultIteratorOptions
+		opts.AllVersions = true
+		opts.PrefetchValues = false
+		// Verify that there are 2 versions and record highest version
+		var ts uint64
 		db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
 				count++
 				item := it.Item()
-				require.True(t, item.Version() >= ts,
-					"item version: %d older than ts: %d",
-					item.Version(), ts)
-				require.Equal(t, []byte("answer"), item.Key())
+				require.Equal(t, []byte("key"), item.Key())
+				if count == 1 {
+					ts = item.Version()
+					require.True(t, item.meta&bitDelete > 0)
+					continue
+				}
+				val, err := item.Value()
+				require.NoError(t, err)
+				require.Equal(t, val, []byte("value"))
+			}
+			require.Equal(t, 2, count)
+			return nil
+		})
+
+		// Delete all versions
+		err = db.PurgeVersionsBelow([]byte("key"), ts)
+		require.NoError(t, err)
+
+		// Verify everything has been deleted
+		db.View(func(txn *Txn) error {
+			it := txn.NewIterator(opts)
+			var count int
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				require.Equal(t, []byte("key"), item.Key())
+				require.True(t, item.meta&bitDelete > 0)
+				count++
 			}
 			require.Equal(t, 2, count)
 			return nil
@@ -893,7 +1020,7 @@ func TestPurgeOlderVersions(t *testing.T) {
 		err = db.PurgeOlderVersions()
 		require.NoError(t, err)
 
-		// Verify that only one version is found
+		// Verify that only one non-deleted version is found
 		err = db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
 			var count int
@@ -901,15 +1028,74 @@ func TestPurgeOlderVersions(t *testing.T) {
 				count++
 				item := it.Item()
 				require.Equal(t, []byte("answer"), item.Key())
-				val, err := item.Value()
-				require.NoError(t, err)
-				t.Logf("Item value is %q", val)
-				//require.Equal(t, []byte("43"), val)
+				if count == 1 {
+					val, err := item.Value()
+					require.NoError(t, err)
+					require.Equal(t, []byte("43"), val)
+				} else {
+					require.True(t, item.meta&bitDelete > 0)
+				}
 			}
-			require.Equal(t, 1, count)
+			require.Equal(t, 2, count)
 			return nil
 		})
 		require.NoError(t, err)
+	})
+}
+
+func TestPurgeOlderVersions2(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		// Do a set and delete of same key
+		err := db.Update(func(txn *Txn) error {
+			return txn.Set([]byte("key"), []byte("value"))
+		})
+		require.NoError(t, err)
+
+		err = db.Update(func(txn *Txn) error {
+			return txn.Delete([]byte("key"))
+		})
+		require.NoError(t, err)
+
+		opts := DefaultIteratorOptions
+		opts.AllVersions = true
+		opts.PrefetchValues = false
+		// Verify that there are 2 versions
+		db.View(func(txn *Txn) error {
+			it := txn.NewIterator(opts)
+			var count int
+			for it.Rewind(); it.Valid(); it.Next() {
+				count++
+				item := it.Item()
+				require.Equal(t, []byte("key"), item.Key())
+				if count == 1 {
+					require.True(t, item.meta&bitDelete > 0)
+					continue
+				}
+				val, err := item.Value()
+				require.NoError(t, err)
+				require.Equal(t, val, []byte("value"))
+			}
+			require.Equal(t, 2, count)
+			return nil
+		})
+
+		// Delete all versions
+		err = db.PurgeOlderVersions()
+		require.NoError(t, err)
+
+		// Verify everything has been deleted
+		db.View(func(txn *Txn) error {
+			it := txn.NewIterator(opts)
+			var count int
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				require.Equal(t, []byte("key"), item.Key())
+				require.True(t, item.meta&bitDelete > 0)
+				count++
+			}
+			require.Equal(t, 2, count)
+			return nil
+		})
 	})
 }
 
@@ -1081,6 +1267,195 @@ func TestWriteDeadlock(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestSequence(t *testing.T) {
+	key0 := []byte("seq0")
+	key1 := []byte("seq1")
+
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		seq0, err := db.GetSequence(key0, 10)
+		require.NoError(t, err)
+		seq1, err := db.GetSequence(key1, 100)
+		require.NoError(t, err)
+
+		for i := uint64(0); i < uint64(105); i++ {
+			num, err := seq0.Next()
+			require.NoError(t, err)
+			require.Equal(t, i, num)
+
+			num, err = seq1.Next()
+			require.NoError(t, err)
+			require.Equal(t, i, num)
+		}
+		err = db.View(func(txn *Txn) error {
+			item, err := txn.Get(key0)
+			if err != nil {
+				return err
+			}
+			val, err := item.Value()
+			if err != nil {
+				return err
+			}
+			num0 := binary.BigEndian.Uint64(val)
+			require.Equal(t, uint64(110), num0)
+
+			item, err = txn.Get(key1)
+			if err != nil {
+				return err
+			}
+			val, err = item.Value()
+			if err != nil {
+				return err
+			}
+			num1 := binary.BigEndian.Uint64(val)
+			require.Equal(t, uint64(200), num1)
+			return nil
+		})
+		require.NoError(t, err)
+	})
+}
+
+func TestSequence_Release(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		// get sequence, use once and release
+		key := []byte("key")
+		seq, err := db.GetSequence(key, 1000)
+		require.NoError(t, err)
+		num, err := seq.Next()
+		require.NoError(t, err)
+		require.Equal(t, uint64(0), num)
+		require.NoError(t, seq.Release())
+
+		// we used up 0 and 1 should be stored now
+		err = db.View(func(txn *Txn) error {
+			item, err := txn.Get(key)
+			if err != nil {
+				return err
+			}
+			val, err := item.Value()
+			if err != nil {
+				return err
+			}
+			require.Equal(t, num+1, binary.BigEndian.Uint64(val))
+			return nil
+		})
+		require.NoError(t, err)
+
+		// using it again will lease 1+1000
+		num, err = seq.Next()
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), num)
+		err = db.View(func(txn *Txn) error {
+			item, err := txn.Get(key)
+			if err != nil {
+				return err
+			}
+			val, err := item.Value()
+			if err != nil {
+				return err
+			}
+			require.Equal(t, uint64(1001), binary.BigEndian.Uint64(val))
+			return nil
+		})
+		require.NoError(t, err)
+	})
+}
+
+func uint64ToBytes(i uint64) []byte {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], i)
+	return buf[:]
+}
+
+func bytesToUint64(b []byte) uint64 {
+	return binary.BigEndian.Uint64(b)
+}
+
+// Merge function to add two uint64 numbers
+func add(existing, new []byte) []byte {
+	return uint64ToBytes(
+		bytesToUint64(existing) +
+			bytesToUint64(new))
+}
+
+func TestMergeOperatorGetBeforeAdd(t *testing.T) {
+	key := []byte("merge")
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		m := db.GetMergeOperator(key, add, 200*time.Millisecond)
+		defer m.Stop()
+
+		_, err := m.Get()
+		require.Error(t, ErrKeyNotFound, err)
+	})
+}
+
+func TestMergeOperatorBeforeAdd(t *testing.T) {
+	key := []byte("merge")
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		m := db.GetMergeOperator(key, add, 200*time.Millisecond)
+		defer m.Stop()
+		time.Sleep(time.Second)
+	})
+}
+
+func TestMergeOperatorAddAndGet(t *testing.T) {
+	key := []byte("merge")
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		m := db.GetMergeOperator(key, add, 200*time.Millisecond)
+		defer m.Stop()
+
+		err := m.Add(uint64ToBytes(1))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(2))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(3))
+		require.NoError(t, err)
+
+		res, err := m.Get()
+		require.NoError(t, err)
+		require.Equal(t, uint64(6), bytesToUint64(res))
+	})
+}
+
+func TestMergeOperatorCompactBeforeGet(t *testing.T) {
+	key := []byte("merge")
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		m := db.GetMergeOperator(key, add, 200*time.Millisecond)
+		defer m.Stop()
+
+		err := m.Add(uint64ToBytes(1))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(2))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(3))
+		require.NoError(t, err)
+
+		time.Sleep(250 * time.Millisecond) // wait for merge to happen
+
+		res, err := m.Get()
+		require.NoError(t, err)
+		require.Equal(t, uint64(6), bytesToUint64(res))
+	})
+}
+
+func TestMergeOperatorGetAfterStop(t *testing.T) {
+	key := []byte("merge")
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		m := db.GetMergeOperator(key, add, 1*time.Second)
+
+		err := m.Add(uint64ToBytes(1))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(2))
+		require.NoError(t, err)
+		m.Add(uint64ToBytes(3))
+		require.NoError(t, err)
+
+		m.Stop()
+		res, err := m.Get()
+		require.NoError(t, err)
+		require.Equal(t, uint64(6), bytesToUint64(res))
+	})
 }
 
 func ExampleOpen() {

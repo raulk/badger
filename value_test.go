@@ -59,8 +59,9 @@ func TestValueBasic(t *testing.T) {
 	require.Len(t, b.Ptrs, 2)
 	t.Logf("Pointer written: %+v %+v\n", b.Ptrs[0], b.Ptrs[1])
 
-	buf1, cb1, err1 := log.readValueBytes(b.Ptrs[0])
-	buf2, cb2, err2 := log.readValueBytes(b.Ptrs[1])
+	s := new(y.Slice)
+	buf1, cb1, err1 := log.readValueBytes(b.Ptrs[0], s)
+	buf2, cb2, err2 := log.readValueBytes(b.Ptrs[1], s)
 	require.NoError(t, err1)
 	require.NoError(t, err2)
 	defer runCallback(cb1)
@@ -529,6 +530,44 @@ func TestValueLogTrigger(t *testing.T) {
 	require.Equal(t, ErrRejected, err, "Error should be returned after closing DB.")
 }
 
+func TestValueLogGC(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	opt := getTestOptions(dir)
+	opt.ValueLogFileSize = 15 << 20
+	runBadgerTest(t, &opt, func(t *testing.T, kv *DB) {
+		sz := 32 << 10
+		for j := 0; j < 40; j++ {
+			err := kv.Update(func(txn *Txn) error {
+				for i := 0; i < 45; i++ {
+					v := make([]byte, sz)
+					rand.Read(v[:rand.Intn(sz)])
+					require.NoError(t, txn.Set([]byte(fmt.Sprintf("key%d", i)), v))
+				}
+				return nil
+			})
+			require.NoError(t, err)
+		}
+		fids := kv.vlog.sortedFids()
+		require.NoError(t, kv.PurgeOlderVersions())
+		require.NoError(t, kv.RunValueLogGC(0.3))
+		newFids := kv.vlog.sortedFids()
+		// No. of value log files after GC should be less than before.
+		// We should have GC-ed more than one value log file.
+		require.True(t, (len(fids)-len(newFids)) > 2)
+		for i, fid := range fids {
+			if i < len(newFids) && newFids[i] == fid {
+				continue
+			}
+			// Check that vlog is deleted.
+			_, err = os.Stat(fmt.Sprintf("dir%c%06d.vlog", os.PathSeparator, fid))
+			require.Error(t, err)
+		}
+	})
+}
+
 func createVlog(t *testing.T, entries []*Entry) []byte {
 	dir, err := ioutil.TempDir("", "badger")
 	require.NoError(t, err)
@@ -606,7 +645,8 @@ func BenchmarkReadWrite(b *testing.B) {
 							b.Fatalf("Zero length of ptrs")
 						}
 						idx := rand.Intn(ln)
-						buf, cb, err := vl.readValueBytes(ptrs[idx])
+						s := new(y.Slice)
+						buf, cb, err := vl.readValueBytes(ptrs[idx], s)
 						if err != nil {
 							b.Fatalf("Benchmark Read: %v", err)
 						}
