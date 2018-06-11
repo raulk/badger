@@ -314,64 +314,6 @@ func TestForceCompactL0(t *testing.T) {
 	require.Equal(t, len(db.lc.levels[0].tables), 0)
 }
 
-func TestGetAfterPurge(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	opts := getTestOptions(dir)
-	opts.ValueLogFileSize = 15 << 20
-	db, err := OpenManaged(opts)
-	require.NoError(t, err)
-	defer db.Close()
-
-	data := func(i int) []byte {
-		return []byte(fmt.Sprintf("%b", i))
-	}
-	n := 80
-	m := 45 // Increasing would cause ErrTxnTooBig
-	sz := 32 << 10
-	v := make([]byte, sz)
-	for i := 0; i < n; i += 2 {
-		version := uint64(i)
-		txn := db.NewTransactionAt(version, true)
-		for j := 0; j < m; j++ {
-			require.NoError(t, txn.Set(data(j), v))
-		}
-		require.NoError(t, txn.CommitAt(version+1, nil))
-	}
-
-	for j := 10; j < m; j++ {
-		err := db.PurgeVersionsBelow(data(j), uint64(80))
-		require.NoError(t, err)
-	}
-	for i := 0; i < 10; i++ {
-		txn := db.NewTransactionAt(80, false)
-		item, err := txn.Get(data(i))
-		require.NoError(t, err)
-		require.Equal(t, item.Version(), uint64(79))
-		txn.Discard()
-	}
-	err = db.RunValueLogGC(0.2)
-	require.NoError(t, err)
-
-	for i := 10; i < m; i++ {
-		txn := db.NewTransactionAt(80, false)
-		_, err := txn.Get(data(i))
-		require.Equal(t, err, ErrKeyNotFound)
-		txn.Discard()
-	}
-
-	for i := 0; i < 10; i++ {
-		txn := db.NewTransactionAt(80, false)
-		item, err := txn.Get(data(i))
-		require.NoError(t, err)
-		require.Equal(t, item.Version(), uint64(79))
-		txn.Discard()
-	}
-
-}
-
 // Put a lot of data to move some data to disk.
 // WARNING: This test might take a while but it should pass!
 func TestGetMore(t *testing.T) {
@@ -733,7 +675,7 @@ func TestDeleteWithoutSyncWrite(t *testing.T) {
 
 	require.NoError(t, kv.View(func(txn *Txn) error {
 		_, err := txn.Get(key)
-		require.Error(t, ErrKeyNotFound, err)
+		require.Equal(t, ErrKeyNotFound, err)
 		return nil
 	}))
 }
@@ -903,12 +845,12 @@ func TestGetSetRace(t *testing.T) {
 	})
 }
 
-func TestPurgeVersionsBelow(t *testing.T) {
+func TestDiscardVersionsBelow(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 		// Write 4 versions of the same key
 		for i := 0; i < 4; i++ {
 			err := db.Update(func(txn *Txn) error {
-				return txn.Set([]byte("answer"), []byte(fmt.Sprintf("%25d", i)))
+				return txn.Set([]byte("answer"), []byte(fmt.Sprintf("%d", i)))
 			})
 			require.NoError(t, err)
 		}
@@ -918,26 +860,26 @@ func TestPurgeVersionsBelow(t *testing.T) {
 		opts.PrefetchValues = false
 
 		// Verify that there are 4 versions, and record 3rd version (2nd from top in iteration)
-		var ts uint64
 		db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
 				count++
 				item := it.Item()
-				if count == 2 {
-					ts = item.Version()
-				}
 				require.Equal(t, []byte("answer"), item.Key())
+				if item.DiscardEarlierVersions() {
+					break
+				}
 			}
 			require.Equal(t, 4, count)
 			return nil
 		})
 
-		// Delete all versions below the 3rd version
-		err := db.PurgeVersionsBelow([]byte("answer"), ts)
+		// Set new version and discard older ones.
+		err := db.Update(func(txn *Txn) error {
+			return txn.SetWithDiscard([]byte("answer"), []byte("5"), 0)
+		})
 		require.NoError(t, err)
-		require.NotEmpty(t, db.vlog.lfDiscardStats.m)
 
 		// Verify that there are only 2 versions left, and versions
 		// below ts have been deleted.
@@ -945,187 +887,14 @@ func TestPurgeVersionsBelow(t *testing.T) {
 			it := txn.NewIterator(opts)
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
-				item := it.Item()
-				if item.Version() < ts {
-					require.True(t, item.meta&bitDelete > 0)
-				} else {
-					count++
-				}
-				require.Equal(t, []byte("answer"), item.Key())
-			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-	})
-}
-
-func TestPurgeVersionsBelow2(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		// Do a set and delete of same key
-		err := db.Update(func(txn *Txn) error {
-			return txn.Set([]byte("key"), []byte("value"))
-		})
-		require.NoError(t, err)
-
-		err = db.Update(func(txn *Txn) error {
-			return txn.Delete([]byte("key"))
-		})
-		require.NoError(t, err)
-
-		opts := DefaultIteratorOptions
-		opts.AllVersions = true
-		opts.PrefetchValues = false
-		// Verify that there are 2 versions and record highest version
-		var ts uint64
-		db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
-				count++
-				item := it.Item()
-				require.Equal(t, []byte("key"), item.Key())
-				if count == 1 {
-					ts = item.Version()
-					require.True(t, item.meta&bitDelete > 0)
-					continue
-				}
-				val, err := item.Value()
-				require.NoError(t, err)
-				require.Equal(t, val, []byte("value"))
-			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-
-		// Delete all versions
-		err = db.PurgeVersionsBelow([]byte("key"), ts)
-		require.NoError(t, err)
-
-		// Verify everything has been deleted
-		db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
-				item := it.Item()
-				require.Equal(t, []byte("key"), item.Key())
-				require.True(t, item.meta&bitDelete > 0)
-				count++
-			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-	})
-}
-
-func TestPurgeOlderVersions(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		// Write two versions of a key
-		err := db.Update(func(txn *Txn) error {
-			return txn.Set([]byte("answer"), []byte("42"))
-		})
-		require.NoError(t, err)
-
-		err = db.Update(func(txn *Txn) error {
-			return txn.Set([]byte("answer"), []byte("43"))
-		})
-		require.NoError(t, err)
-
-		opts := DefaultIteratorOptions
-		opts.AllVersions = true
-		opts.PrefetchValues = false
-
-		// Verify that two versions are found during iteration
-		err = db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
 				count++
 				item := it.Item()
 				require.Equal(t, []byte("answer"), item.Key())
-			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-		require.NoError(t, err)
-
-		// Invoke DeleteOlderVersions() to delete older version
-		err = db.PurgeOlderVersions()
-		require.NoError(t, err)
-
-		// Verify that only one non-deleted version is found
-		err = db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
-				count++
-				item := it.Item()
-				require.Equal(t, []byte("answer"), item.Key())
-				if count == 1 {
-					val, err := item.Value()
-					require.NoError(t, err)
-					require.Equal(t, []byte("43"), val)
-				} else {
-					require.True(t, item.meta&bitDelete > 0)
+				if item.DiscardEarlierVersions() {
+					break
 				}
 			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-		require.NoError(t, err)
-	})
-}
-
-func TestPurgeOlderVersions2(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		// Do a set and delete of same key
-		err := db.Update(func(txn *Txn) error {
-			return txn.Set([]byte("key"), []byte("value"))
-		})
-		require.NoError(t, err)
-
-		err = db.Update(func(txn *Txn) error {
-			return txn.Delete([]byte("key"))
-		})
-		require.NoError(t, err)
-
-		opts := DefaultIteratorOptions
-		opts.AllVersions = true
-		opts.PrefetchValues = false
-		// Verify that there are 2 versions
-		db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
-				count++
-				item := it.Item()
-				require.Equal(t, []byte("key"), item.Key())
-				if count == 1 {
-					require.True(t, item.meta&bitDelete > 0)
-					continue
-				}
-				val, err := item.Value()
-				require.NoError(t, err)
-				require.Equal(t, val, []byte("value"))
-			}
-			require.Equal(t, 2, count)
-			return nil
-		})
-
-		// Delete all versions
-		err = db.PurgeOlderVersions()
-		require.NoError(t, err)
-
-		// Verify everything has been deleted
-		db.View(func(txn *Txn) error {
-			it := txn.NewIterator(opts)
-			var count int
-			for it.Rewind(); it.Valid(); it.Next() {
-				item := it.Item()
-				require.Equal(t, []byte("key"), item.Key())
-				require.True(t, item.meta&bitDelete > 0)
-				count++
-			}
-			require.Equal(t, 2, count)
+			require.Equal(t, 1, count)
 			return nil
 		})
 	})
@@ -1152,7 +921,7 @@ func TestExpiry(t *testing.T) {
 			require.NoError(t, err)
 
 			_, err = txn.Get([]byte("answer2"))
-			require.Error(t, ErrKeyNotFound, err)
+			require.Equal(t, ErrKeyNotFound, err)
 			return nil
 		})
 		require.NoError(t, err)
@@ -1466,7 +1235,7 @@ func TestMergeOperatorGetBeforeAdd(t *testing.T) {
 		defer m.Stop()
 
 		_, err := m.Get()
-		require.Error(t, ErrKeyNotFound, err)
+		require.Equal(t, ErrKeyNotFound, err)
 	})
 }
 
@@ -1605,6 +1374,83 @@ func TestReadOnly(t *testing.T) {
 	require.Contains(t, err.Error(), "No sets or deletes are allowed in a read-only transaction")
 	err = txn.Commit(nil)
 	require.NoError(t, err)
+}
+
+func TestLSMOnly(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	opts := LSMOnlyOptions
+	opts.Dir = dir
+	opts.ValueDir = dir
+
+	dopts := DefaultOptions
+	require.NotEqual(t, dopts.ValueThreshold, opts.ValueThreshold)
+	require.NotEqual(t, dopts.ValueLogLoadingMode, opts.ValueLogLoadingMode)
+	require.NotEqual(t, dopts.ValueLogFileSize, opts.ValueLogFileSize)
+
+	dopts.ValueThreshold = 1 << 16
+	_, err = Open(dopts)
+	require.Equal(t, ErrValueThreshold, err)
+
+	opts.ValueLogMaxEntries = 100
+	db, err := Open(opts)
+	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value := make([]byte, 128)
+	_, err = rand.Read(value)
+	for i := 0; i < 500; i++ {
+		require.NoError(t, err)
+		txnSet(t, db, []byte(fmt.Sprintf("key%d", i)), value, 0x00)
+	}
+	require.NoError(t, db.Close()) // Close to force compactions, so Value log GC would run.
+
+	db, err = Open(opts)
+	require.NoError(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	require.NoError(t, db.RunValueLogGC(0.2))
+}
+
+func TestMinReadTs(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		for i := 0; i < 10; i++ {
+			require.NoError(t, db.Update(func(txn *Txn) error {
+				return txn.Set([]byte("x"), []byte("y"))
+			}))
+		}
+		time.Sleep(time.Millisecond)
+		require.Equal(t, uint64(10), db.orc.readTs())
+		min := db.orc.readMark.MinReadTs()
+		require.Equal(t, uint64(9), min)
+
+		readTxn := db.NewTransaction(false)
+		for i := 0; i < 10; i++ {
+			require.NoError(t, db.Update(func(txn *Txn) error {
+				return txn.Set([]byte("x"), []byte("y"))
+			}))
+		}
+		require.Equal(t, uint64(20), db.orc.readTs())
+		time.Sleep(time.Millisecond)
+		require.Equal(t, min, db.orc.readMark.MinReadTs())
+		readTxn.Discard()
+		time.Sleep(time.Millisecond)
+		require.Equal(t, uint64(19), db.orc.readMark.MinReadTs())
+
+		for i := 0; i < 10; i++ {
+			db.View(func(txn *Txn) error {
+				return nil
+			})
+		}
+		time.Sleep(time.Millisecond)
+		require.Equal(t, uint64(20), db.orc.readMark.MinReadTs())
+	})
 }
 
 func ExampleOpen() {

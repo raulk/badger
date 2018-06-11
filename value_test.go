@@ -25,6 +25,7 @@ import (
 
 	"github.com/dgraph-io/badger/y"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/trace"
 )
 
 func TestValueBasic(t *testing.T) {
@@ -119,7 +120,9 @@ func TestValueGC(t *testing.T) {
 	//		return true
 	//	})
 
-	kv.vlog.rewrite(lf)
+	tr := trace.New("Test", "Test")
+	defer tr.Finish()
+	kv.vlog.rewrite(lf, tr)
 	for i := 45; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 
@@ -175,12 +178,14 @@ func TestValueGC2(t *testing.T) {
 	//		return true
 	//	})
 
-	kv.vlog.rewrite(lf)
+	tr := trace.New("Test", "Test")
+	defer tr.Finish()
+	kv.vlog.rewrite(lf, tr)
 	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		require.NoError(t, kv.View(func(txn *Txn) error {
 			_, err := txn.Get(key)
-			require.Error(t, ErrKeyNotFound, err)
+			require.Equal(t, ErrKeyNotFound, err)
 			return nil
 		}))
 	}
@@ -270,7 +275,9 @@ func TestValueGC3(t *testing.T) {
 	logFile := kv.vlog.filesMap[kv.vlog.sortedFids()[0]]
 	kv.vlog.filesLock.RUnlock()
 
-	kv.vlog.rewrite(logFile)
+	tr := trace.New("Test", "Test")
+	defer tr.Finish()
+	kv.vlog.rewrite(logFile, tr)
 	it.Next()
 	require.True(t, it.Valid())
 	item = it.Item()
@@ -323,8 +330,10 @@ func TestValueGC4(t *testing.T) {
 	//		return true
 	//	})
 
-	kv.vlog.rewrite(lf0)
-	kv.vlog.rewrite(lf1)
+	tr := trace.New("Test", "Test")
+	defer tr.Finish()
+	kv.vlog.rewrite(lf0, tr)
+	kv.vlog.rewrite(lf1, tr)
 
 	// Replay value log
 	kv.vlog.Replay(valuePointer{Fid: 2}, replayFunction(kv))
@@ -368,10 +377,10 @@ func TestChecksums(t *testing.T) {
 		k1 = []byte("k1")
 		k2 = []byte("k2")
 		k3 = []byte("k3")
-		v0 = []byte("value0-012345678901234567890123")
-		v1 = []byte("value1-012345678901234567890123")
-		v2 = []byte("value2-012345678901234567890123")
-		v3 = []byte("value3-012345678901234567890123")
+		v0 = []byte("value0-012345678901234567890123012345678901234567890123")
+		v1 = []byte("value1-012345678901234567890123012345678901234567890123")
+		v2 = []byte("value2-012345678901234567890123012345678901234567890123")
+		v3 = []byte("value3-012345678901234567890123012345678901234567890123")
 	)
 	// Make sure the value log would actually store the item
 	require.True(t, len(v0) >= kv.opt.ValueThreshold)
@@ -395,10 +404,10 @@ func TestChecksums(t *testing.T) {
 		require.Equal(t, getItemValue(t, item), v0)
 
 		_, err = txn.Get(k1)
-		require.Error(t, ErrKeyNotFound, err)
+		require.Equal(t, ErrKeyNotFound, err)
 
 		_, err = txn.Get(k2)
-		require.Error(t, ErrKeyNotFound, err)
+		require.Equal(t, ErrKeyNotFound, err)
 		return nil
 	}))
 
@@ -451,10 +460,10 @@ func TestPartialAppendToValueLog(t *testing.T) {
 		k1 = []byte("k1")
 		k2 = []byte("k2")
 		k3 = []byte("k3")
-		v0 = []byte("value0-012345678901234567890123")
-		v1 = []byte("value1-012345678901234567890123")
-		v2 = []byte("value2-012345678901234567890123")
-		v3 = []byte("value3-012345678901234567890123")
+		v0 = []byte("value0-01234567890123456789012012345678901234567890123")
+		v1 = []byte("value1-01234567890123456789012012345678901234567890123")
+		v2 = []byte("value2-01234567890123456789012012345678901234567890123")
+		v3 = []byte("value3-01234567890123456789012012345678901234567890123")
 	)
 	// Values need to be long enough to actually get written to value log.
 	require.True(t, len(v3) >= kv.opt.ValueThreshold)
@@ -564,51 +573,12 @@ func TestValueLogTrigger(t *testing.T) {
 		txnDelete(t, kv, []byte(fmt.Sprintf("key%d", i)))
 	}
 
-	require.NoError(t, kv.PurgeOlderVersions())
 	require.NoError(t, kv.RunValueLogGC(0.5))
 
 	require.NoError(t, kv.Close())
 
 	err = kv.RunValueLogGC(0.5)
 	require.Equal(t, ErrRejected, err, "Error should be returned after closing DB.")
-}
-
-func TestValueLogGC(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	opt := getTestOptions(dir)
-	opt.ValueLogFileSize = 15 << 20
-	runBadgerTest(t, &opt, func(t *testing.T, kv *DB) {
-		sz := 32 << 10
-		for j := 0; j < 40; j++ {
-			err := kv.Update(func(txn *Txn) error {
-				for i := 0; i < 45; i++ {
-					v := make([]byte, sz)
-					rand.Read(v[:rand.Intn(sz)])
-					require.NoError(t, txn.Set([]byte(fmt.Sprintf("key%d", i)), v))
-				}
-				return nil
-			})
-			require.NoError(t, err)
-		}
-		fids := kv.vlog.sortedFids()
-		require.NoError(t, kv.PurgeOlderVersions())
-		require.NoError(t, kv.RunValueLogGC(0.3))
-		newFids := kv.vlog.sortedFids()
-		// No. of value log files after GC should be less than before.
-		// We should have GC-ed more than one value log file.
-		require.True(t, (len(fids)-len(newFids)) > 2)
-		for i, fid := range fids {
-			if i < len(newFids) && newFids[i] == fid {
-				continue
-			}
-			// Check that vlog is deleted.
-			_, err = os.Stat(fmt.Sprintf("dir%c%06d.vlog", os.PathSeparator, fid))
-			require.Error(t, err)
-		}
-	})
 }
 
 func createVlog(t *testing.T, entries []*Entry) []byte {
