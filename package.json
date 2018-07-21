@@ -33,9 +33,9 @@
     },
     {
       "author": "whyrusleeping",
-      "hash": "QmTEmsyNnckEq8rEfALfdhLHjrEHGoSGFDrAYReuetn7MC",
+      "hash": "QmRvYNctevGUW52urgmoFZscT6buMKqhHezLUS64WepGWn",
       "name": "go-net",
-      "version": "0.0.0"
+      "version": "0.2.0"
     },
     {
       "author": "why",
@@ -55,6 +55,6 @@
   "license": "Apache 2.0",
   "name": "badger",
   "releaseCmd": "git commit -a -m \"gx publish $VERSION\"",
-  "version": "2.7.0"
+  "version": "2.7.1"
 }
 
