@@ -21,9 +21,9 @@
     },
     {
       "author": "kubuxu",
-      "hash": "QmXqKGu7QzfRzFC4yd5aL9sThYx22vY163VGwmxfp5qGHk",
+      "hash": "QmWaLViWQF8jgyoLLqqcSrnp6dJpHESiJfzor1vrfDyTZf",
       "name": "bbloom",
-      "version": "0.1.1"
+      "version": "0.1.2"
     },
     {
       "author": "kubuxu",
@@ -39,9 +39,9 @@
     },
     {
       "author": "why",
-      "hash": "QmXSs8cccbT4zDR95c1iRpYKDqVMzqeF1J6iZcavgE6eNw",
+      "hash": "QmTiLGZPz8ZaQPxg1mteXzhjTTYN3S3TVVrAUdrZTyDLXb",
       "name": "protobuf",
-      "version": "0.0.0"
+      "version": "1.1.0"
     },
     {
       "author": "magik6k",
