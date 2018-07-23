@@ -29,7 +29,7 @@ import (
 
 	"github.com/dgraph-io/badger/options"
 	"github.com/dgraph-io/badger/y"
-	"github.com/gxed/bbloom"
+	"github.com/ipfs/bbloom"
 	"github.com/pkg/errors"
 )
 

@@ -23,7 +23,7 @@ import (
 	"math"
 
 	"github.com/dgraph-io/badger/y"
-	"github.com/gxed/bbloom"
+	"github.com/ipfs/bbloom"
 )
 
 var (

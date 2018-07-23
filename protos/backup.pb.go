@@ -15,7 +15,7 @@
 */
 package protos
 
-import proto "github.com/gxed/protobuf/proto"
+import proto "github.com/golang/protobuf/proto"
 import fmt "fmt"
 import math "math"
 
