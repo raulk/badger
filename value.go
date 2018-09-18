@@ -263,7 +263,12 @@ func (vlog *valueLog) iterate(lf *logFile, offset uint32, fn logEntry) error {
 	truncate := false
 	var lastCommit uint64
 	var validEndOffset uint32
+	var count int
 	for {
+		count++
+		if count%2000 == 0 {
+			log.Printf("Replaying log file: %d. Running count: %d\n", lf.fid, count)
+		}
 		e, err := read.Entry(reader)
 		if err == io.EOF {
 			break
@@ -387,7 +392,8 @@ func (vlog *valueLog) rewrite(f *logFile, tr trace.Trace) error {
 			if bytes.HasPrefix(e.Key, badgerMove) {
 				ne.Key = append([]byte{}, e.Key...)
 			} else {
-				ne.Key = append(badgerMove, e.Key...)
+				ne.Key = append([]byte{}, badgerMove...)
+				ne.Key = append(ne.Key, e.Key...)
 			}
 
 			ne.Value = append([]byte{}, e.Value...)
@@ -754,6 +760,7 @@ func (vlog *valueLog) Replay(ptr valuePointer, fn logEntry) error {
 	fid := ptr.Fid
 	offset := ptr.Offset + ptr.Len
 	vlog.elog.Printf("Seeking at value pointer: %+v\n", ptr)
+	log.Printf("Replaying from value pointer: %+v\n", ptr)
 
 	fids := vlog.sortedFids()
 
@@ -766,7 +773,10 @@ func (vlog *valueLog) Replay(ptr valuePointer, fn logEntry) error {
 			of = 0
 		}
 		f := vlog.filesMap[id]
+		log.Printf("Iterating file id: %d", id)
+		now := time.Now()
 		err := vlog.iterate(f, of, fn)
+		log.Printf("Iteration took: %s\n", time.Since(now))
 		if err != nil {
 			return errors.Wrapf(err, "Unable to replay value log: %q", f.path)
 		}
@@ -856,7 +866,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 			}
 
 			newid := atomic.AddUint32(&vlog.maxFid, 1)
-			y.AssertTruef(newid <= math.MaxUint32, "newid will overflow uint32: %v", newid)
+			y.AssertTruef(newid > 0, "newid has overflown uint32: %v", newid)
 			newlf, err := vlog.createVlogFile(newid)
 			if err != nil {
 				return err

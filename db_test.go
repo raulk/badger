@@ -25,6 +25,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -862,6 +863,7 @@ func TestDiscardVersionsBelow(t *testing.T) {
 		// Verify that there are 4 versions, and record 3rd version (2nd from top in iteration)
 		db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
+			defer it.Close()
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
 				count++
@@ -885,6 +887,7 @@ func TestDiscardVersionsBelow(t *testing.T) {
 		// below ts have been deleted.
 		db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
+			defer it.Close()
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
 				count++
@@ -931,6 +934,7 @@ func TestExpiry(t *testing.T) {
 		opts.PrefetchValues = false
 		err = db.View(func(txn *Txn) error {
 			it := txn.NewIterator(opts)
+			defer it.Close()
 			var count int
 			for it.Rewind(); it.Valid(); it.Next() {
 				count++
@@ -1099,6 +1103,7 @@ func TestWriteDeadlock(t *testing.T) {
 		opt := DefaultIteratorOptions
 		opt.PrefetchValues = false
 		it := txn.NewIterator(opt)
+		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 
@@ -1558,6 +1563,7 @@ func ExampleTxn_NewIterator() {
 	var count int
 	err = db.View(func(txn *Txn) error {
 		it := txn.NewIterator(opt)
+		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			count++
 		}
@@ -1569,4 +1575,14 @@ func ExampleTxn_NewIterator() {
 	fmt.Printf("Counted %d elements", count)
 	// Output:
 	// Counted 1000 elements
+}
+
+func TestMain(m *testing.M) {
+	// call flag.Parse() here if TestMain uses flags
+	go func() {
+		if err := http.ListenAndServe("localhost:8080", nil); err != nil {
+			log.Fatalf("Unable to open http port at 8080")
+		}
+	}()
+	os.Exit(m.Run())
 }
